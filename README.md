@@ -6,4 +6,5 @@
 - Load weights from huggingface
 
 To-dos
-[ ] Check weights correctness.
+
+- [ ] Check weights correctness.
