@@ -34,7 +34,7 @@ end
 
 function padded_input_and_mask_len(x::AbstractMatrix, v, cfg, pad_token_id)
     return padded_input_and_mask_len(
-        x, v, get_padded_size(size(x, 1) + v !== nothing, cfg.max_position_embeddings), pad_token_id
+        x, v, get_padded_size(size(x, 1) + (v !== nothing), cfg.max_position_embeddings), pad_token_id
     )
 end
 
@@ -115,16 +115,15 @@ function SmolTokenizer(
 )
     tok = HuggingFaceTokenizers.from_file(Tokenizer, tokenizer_file_path)
     special_to_id = Dict(s => token_to_id(tok, s) for s in SPECIALS)
-    pad_token_id = special_to_id["<|endoftext|>"]
-    eos_token_id = pad_token_id
     if repo_id !== nothing && !occursin("Base", repo_id)
         eos_token = "<|im_end|>"
+        pad_token = "<|im_end|>"
     else
         eos_token = "<|endoftext|>"
+        pad_token = "<|endoftext|>"
     end
-    if haskey(special_to_id, eos_token)
-        eos_token_id = special_to_id[eos_token]
-    end
+    pad_token_id = special_to_id[pad_token]
+    eos_token_id = special_to_id[eos_token]
     return SmolTokenizer(
         tok,
         special_to_id,
@@ -137,14 +136,10 @@ function SmolTokenizer(
 end
 
 function wrap_chat(tokenizer::SmolTokenizer, user_msg::AbstractString)
-    s = "<|im_start|>user\n$(user_msg)<|im_end|>\n"
+    s = "<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n"
+    s *= "<|im_start|>user\n$(user_msg)<|im_end|>\n"
     if tokenizer.add_generation_prompt
-        s *= "<|im_start|>assistant"
-        if tokenizer.add_thinking
-            s *= "\n"
-        else
-            s *= "\n<think>\n\n</think>\n\n"
-        end
+        s *= "<|im_start|>assistant\n"
     end
     return s
 end
@@ -183,14 +178,17 @@ end
 weights_path = joinpath(@__DIR__, "weights") 
 
 # ╔═╡ d10633a6-44dd-4a9a-9881-f36a15a8e57d
-smtok = SmolTokenizer(joinpath(weights_path, "tokenizer.json"))
+smtok = SmolTokenizer(
+	joinpath(weights_path, "tokenizer.json");
+	repo_id = "HuggingFaceTB/SmolLM2-360M-Instruct",
+	add_generation_prompt = true,
+)
 
 # ╔═╡ 9999bb0f-2d52-4777-9334-6c2e58141721
 weights_dict = load_safetensors(joinpath(weights_path, "model.safetensors"))
 
 # ╔═╡ 9bcb4599-e27b-48c1-a2f0-78d4e1972888
 begin
-altRMSNorm(emb_dim::Int) = AlternatePrecision{Float32}(RMSNorm(emb_dim; affine = false))
 
 function apply_rope(x::AbstractArray{T}, cos_cache, sin_cache) where {T}
     return T.(apply_rotary_embedding(x, cos_cache, sin_cache; seq_dim=3))
@@ -217,8 +215,6 @@ function GroupedQueryAttention(cfg)
         k_proj = Dense(d_in, num_kv_groups * head_dim; use_bias=false),
         v_proj = Dense(d_in, num_kv_groups * head_dim; use_bias=false),
         o_proj = Dense(d_out, d_in; use_bias=false),
-        q_norm = altRMSNorm(head_dim),
-        k_norm = altRMSNorm(head_dim),
 		cache = @init_fn(rng -> compute_rotary_embedding_params(
         head_dim, max_pos; base=θ, dtype=Float32
     ), :state)
@@ -235,15 +231,11 @@ function GroupedQueryAttention(cfg)
     	keys = reshape(keys, head_dim, num_kv_groups, num_tokens, batch)
     	values = reshape(values, head_dim, num_kv_groups, num_tokens, batch)
 
-		queries = q_norm(queries)
-		keys = k_norm(keys)
-
-		
 		queries = apply_rope(queries, cache[:cos_cache], cache[:sin_cache])
 		keys = apply_rope(keys, cache[:cos_cache], cache[:sin_cache])
 
 		context = scaled_dot_product_attention(
-			queries, keys, values;
+			queries, keys, values; is_causal = true
 		)[1]
 
 		context = reshape(context,head_dim * num_heads, num_tokens, batch)
@@ -443,7 +435,7 @@ function gen(prompt, model, ps, st; tokenizer = smtok)
 	model = model |> rdev
 	ps = ps |> rdev
 	st = st |> rdev
-	tokens_per_second = generate_text(model, prompt, ps, st, 100_000, tokenizer)
+	tokens_per_second = generate_text(model, prompt, ps, st, 512, tokenizer)
 
 	println("\nTokens per second: $tokens_per_second\n\n")
 	
@@ -501,12 +493,9 @@ function load_weights(weights_dict, cfg)
 	for l in 0:cfg.num_hidden_layers-1
 
 		layer = (;
-				gqa = merge(
-					NamedTuple(					
-						k => (; weight = W(l, "self_attn.$k")) for k in 
-								(:q_proj, :k_proj, :v_proj, :o_proj)
-					),
-					NamedTuple(n => (; weight = ()) for n in (:q_norm, :k_norm))
+				gqa = NamedTuple(
+					k => (; weight = W(l, "self_attn.$k")) for k in
+							(:q_proj, :k_proj, :v_proj, :o_proj)
 				),
 				mlp = (;
 					proj = (; gate_proj = (;weight = W(l, "mlp.gate_proj")),
@@ -575,7 +564,7 @@ function smol(cfg)
 	
 	layernorm(emb_dim::Int) = AlternatePrecision{Float32}(RMSNorm(emb_dim; affine = true))
 	
-	layers = map(1:32) do _
+	layers = map(1:cfg.num_hidden_layers) do _
 		AttnBlock(GroupedQueryAttention(cfg), MLP(cfg))
 	end
 	
@@ -637,8 +626,6 @@ function GroupedQueryAttention(cfg)
         k_proj = Dense(d_in, num_kv_groups * head_dim; use_bias=false),
         v_proj = Dense(d_in, num_kv_groups * head_dim; use_bias=false),
         o_proj = Dense(d_out, d_in; use_bias=false),
-        q_norm = altRMSNorm(head_dim),
-        k_norm = altRMSNorm(head_dim),
 		cache = @init_fn(rng -> compute_rotary_embedding_params(
         head_dim, max_pos; base=θ, dtype=Float32
     ), :state)
@@ -655,15 +642,11 @@ function GroupedQueryAttention(cfg)
     	keys = reshape(keys, head_dim, num_kv_groups, num_tokens, batch)
     	values = reshape(values, head_dim, num_kv_groups, num_tokens, batch)
 
-		queries = q_norm(queries)
-		keys = k_norm(keys)
-
-		
 		queries = apply_rope(queries, cache[:cos_cache], cache[:sin_cache])
 		keys = apply_rope(keys, cache[:cos_cache], cache[:sin_cache])
 
 		context = scaled_dot_product_attention(
-			queries, keys, values;
+			queries, keys, values; is_causal = true
 		)[1]
 
 		context = reshape(context,head_dim * num_heads, num_tokens, batch)
@@ -678,7 +661,7 @@ gqa = GroupedQueryAttention(cfg)
 
 ps, st = Lux.setup(rng, gqa)
 
-x = rand(Float32, (960, 7, 1))
+x = rand(Float32, (cfg.hidden_size, 7, 1))
 
 gqa(x, ps, st)[1]
 end
@@ -693,7 +676,7 @@ function generate(model, ps, st, tokenizer, prompt; n_tokens=30)
         next_token = argmax(o[:, end, 1])
         push!(tokens, next_token)
     end
-    decode(tokenizer, tokens .- 1)
+    decode(tokenizer, tokens)
 end
 
 # ╔═╡ 60843222-91b2-4d0d-82df-26b2136b8231
@@ -703,7 +686,7 @@ function load_model_and_gen(get_model, cfg, tokenizer, prompt; n_token = 3)
 	ps = load_weights(weights_dict, cfg) |> gpu
 	st = Lux.initialstates(rng, mm)  |> gpu
 
-	generate(mm, ps, st, tokenizer, prompt; n_token)
+	generate(mm, ps, st, tokenizer, prompt; n_tokens = n_token)
 end
 
 # ╔═╡ e2ee0274-5847-440d-9f1d-c2117d63b256
